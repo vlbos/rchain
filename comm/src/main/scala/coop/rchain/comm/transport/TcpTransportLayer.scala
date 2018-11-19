@@ -40,6 +40,8 @@ class TcpTransportLayer(port: Int, cert: String, key: String, maxMessageSize: In
   private def certInputStream = new ByteArrayInputStream(cert.getBytes())
   private def keyInputStream  = new ByteArrayInputStream(key.getBytes())
 
+  private val streamObservable = new StreamObservable(100)
+
   import connections.cell
 
   private lazy val serverSslContext: SslContext =
@@ -51,7 +53,7 @@ class TcpTransportLayer(port: Int, cert: String, key: String, maxMessageSize: In
         .build()
     } catch {
       case e: Throwable =>
-        println(e.getMessage)
+        e.printStackTrace()
         throw e
     }
 
@@ -121,46 +123,33 @@ class TcpTransportLayer(port: Int, cert: String, key: String, maxMessageSize: In
   ): Task[CommErr[Option[Protocol]]] =
     withClient(peer, enforce)(f).attempt.map(processResponse(peer, _))
 
-  def chunkIt(blob: Blob): Iterator[Chunk] = {
-    val raw      = blob.packet.content.toByteArray
-    val kb500    = 1024 * 500
-    val compress = raw.length > kb500
-    val content  = if (compress) raw.compress else raw
+  def chunkIt(blob: Blob): Task[Iterator[Chunk]] =
+    Task.delay {
+      val raw      = blob.packet.content.toByteArray
+      val kb500    = 1024 * 500
+      val compress = raw.length > kb500
+      val content  = if (compress) raw.compress else raw
 
-    def header: Chunk =
-      Chunk().withHeader(
-        ChunkHeader()
-          .withCompressed(compress)
-          .withDecompressedLength(raw.length)
-          .withSender(ProtocolHelper.node(blob.sender))
-          .withTypeId(blob.packet.typeId)
-      )
-    val buffer    = 2 * 1024 // 2 kbytes for protobuf related stuff
-    val chunkSize = maxMessageSize - buffer
-    def data: Iterator[Chunk] =
-      content.sliding(chunkSize, chunkSize).map { data =>
-        Chunk().withData(ChunkData().withContentData(ProtocolHelper.toProtocolBytes(data)))
-      }
+      def header: Chunk =
+        Chunk().withHeader(
+          ChunkHeader()
+            .withCompressed(compress)
+            .withContentLength(raw.length)
+            .withSender(ProtocolHelper.node(blob.sender))
+            .withTypeId(blob.packet.typeId)
+        )
+      val buffer    = 2 * 1024 // 2 kbytes for protobuf related stuff
+      val chunkSize = maxMessageSize - buffer
+      def data: Iterator[Chunk] =
+        content.sliding(chunkSize, chunkSize).map { data =>
+          Chunk().withData(ChunkData().withContentData(ProtocolHelper.toProtocolBytes(data)))
+        }
 
-    Iterator(header) ++ data
-  }
+      Iterator(header) ++ data
+    }
 
-  /**
-    * This implmementation is temporary, it sequentially sends blob to each peers.
-    * TODO Provide solution that stacks blob on a queue that is later consumed
-    */
   def stream(peers: Seq[PeerNode], blob: Blob): Task[Unit] =
-    peers.toList
-      .traverse[Task, Unit](
-        peer =>
-          withClient(peer, enforce = false) { stub =>
-            stub.stream(Observable.fromIterator(chunkIt(blob)))
-          }.attempt.flatMap {
-            case Left(error) => log.debug(s"Error while streaming packet, error: $error")
-            case Right(_)    => Task.unit
-          }
-      )
-      .as(())
+    streamObservable.stream(peers.toList, blob) *> log.info(s"stream to $peers blob")
 
   private def processResponse(
       peer: PeerNode,
@@ -215,14 +204,32 @@ class TcpTransportLayer(port: Int, cert: String, key: String, maxMessageSize: In
   def broadcast(peers: Seq[PeerNode], msg: Protocol): Task[Seq[CommErr[Unit]]] =
     innerBroadcast(peers, msg)
 
-  private def receiveInternal(
-      parallelism: Int
-  )(
+  def handleToStream: ToStream => Task[Unit] = {
+    case ToStream(peer, blob) =>
+      withClient(peer, enforce = false) { stub =>
+        stub.stream(Observable.fromIterator(chunkIt(blob)))
+      }.attempt.flatMap {
+        case Left(error) => log.debug(s"Error while streaming packet, error: $error")
+        case Right(_)    => Task.unit
+      }
+  }
+
+  private def initQueue(
+      maybeQueue: Option[Cancelable]
+  )(create: Task[Cancelable]): Task[Cancelable] =
+    maybeQueue.fold(create) {
+      kp(
+        Task.raiseError[Cancelable](
+          new RuntimeException("TransportLayer server is already started")
+        )
+      )
+    }
+
+  def receive(
       dispatch: Protocol => Task[CommunicationResponse],
       handleStreamed: Blob => Task[Unit]
-  ): Task[Cancelable] = {
-
-    def dispatchInternal: ServerMessage => Task[Unit] = {
+  ): Task[Unit] = {
+    val dispatchInternal: ServerMessage => Task[Unit] = {
       // TODO: consider logging on failure (Left)
       case Tell(protocol) => dispatch(protocol).attemptAndLog.void
       case Ask(protocol, handle) if !handle.complete =>
@@ -234,37 +241,36 @@ class TcpTransportLayer(port: Int, cert: String, key: String, maxMessageSize: In
       case _                   => Task.unit // sender timeout
     }
 
-    Task.delay {
-      new TcpServerObservable(port, serverSslContext, maxMessageSize)
-        .mapParallelUnordered(parallelism)(dispatchInternal)
-        .subscribe()(Scheduler.fixedPool("tl-dispatcher", parallelism))
-    }
-  }
-
-  def receive(
-      dispatch: Protocol => Task[CommunicationResponse],
-      handleStreamed: Blob => Task[Unit]
-  ): Task[Unit] =
     cell.modify { s =>
+      val parallelism    = Math.max(Runtime.getRuntime.availableProcessors(), 2)
+      val queueScheduler = Scheduler.fixedPool("tl-dispatcher", parallelism)
       for {
-        server <- s.server match {
-                   case Some(_) =>
-                     Task.raiseError(
-                       new RuntimeException("TransportLayer server is already started")
-                     )
-                   case _ =>
-                     val parallelism = Math.max(Runtime.getRuntime.availableProcessors(), 2)
-                     receiveInternal(parallelism)(dispatch, handleStreamed)
-                 }
-      } yield s.copy(server = Some(server))
+        server <- initQueue(s.server) {
+                   Task.delay {
+                     new TcpServerObservable(port, serverSslContext, maxMessageSize)
+                       .mapParallelUnordered(parallelism)(dispatchInternal)
+                       .subscribe()(queueScheduler)
+                   }
 
+                 }
+        clientQueue <- initQueue(s.clientQueue) {
+                        Task.delay {
+                          streamObservable
+                            .mapParallelUnordered(parallelism)(handleToStream)
+                            .subscribe()(queueScheduler)
+                        }
+                      }
+      } yield s.copy(server = Some(server), clientQueue = Some(clientQueue))
     }
+
+  }
 
   def shutdown(msg: Protocol): Task[Unit] = {
     def shutdownServer: Task[Unit] = cell.modify { s =>
       for {
         _ <- log.info("Shutting down server")
         _ <- s.server.fold(Task.unit)(server => Task.delay(server.cancel()))
+        _ <- s.clientQueue.fold(Task.unit)(server => Task.delay(server.cancel()))
       } yield s.copy(server = None, shutdown = true)
     }
 
@@ -293,6 +299,7 @@ object TcpTransportLayer {
 case class TransportState(
     connections: TcpTransportLayer.Connections = Map.empty,
     server: Option[Cancelable] = None,
+    clientQueue: Option[Cancelable] = None,
     shutdown: Boolean = false
 )
 

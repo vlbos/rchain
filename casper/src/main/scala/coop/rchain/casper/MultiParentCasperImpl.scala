@@ -118,8 +118,6 @@ class MultiParentCasperImpl[F[_]: Sync: Capture: ConnectionsCell: TransportLayer
                 else if (!validSig) InvalidUnslashableBlock.pure[F]
                 else if (!validSender) InvalidUnslashableBlock.pure[F]
                 else if (!validVersion) InvalidUnslashableBlock.pure[F]
-                else if (validatorId.exists(id => ByteString.copyFrom(id.publicKey) == b.sender))
-                  addEffects(Valid, b).map(_ => Valid)
                 else attemptAdd(b)
       _ <- attempt match {
             case MissingBlocks => ().pure[F]
@@ -174,19 +172,23 @@ class MultiParentCasperImpl[F[_]: Sync: Capture: ConnectionsCell: TransportLayer
   def contains(b: BlockMessage): F[Boolean] =
     BlockStore[F].contains(b.blockHash).map(_ || blockBuffer.contains(b))
 
+  def deploy(deploy: Deploy): F[Unit] =
+    for {
+      _ <- Sync[F].delay {
+            deployHist += deploy
+          }
+      _ <- Log[F].info(s"Received ${PrettyPrinter.buildString(deploy)}")
+    } yield ()
+
   def deploy(d: DeployData): F[Either[Throwable, Unit]] =
     InterpreterUtil.mkTerm(d.term) match {
       case Right(term) =>
-        val deploy = Deploy(
-          term = Some(term),
-          raw = Some(d)
-        )
-        for {
-          _ <- Capture[F].capture {
-                deployHist += deploy
-              }
-          _ <- Log[F].info(s"Received ${PrettyPrinter.buildString(deploy)}")
-        } yield Right(())
+        deploy(
+          Deploy(
+            term = Some(term),
+            raw = Some(d)
+          )
+        ).as(Right(()))
 
       case Left(err) =>
         Applicative[F].pure(Left(new Exception(s"Error in parsing term: \n$err")))
@@ -263,7 +265,7 @@ class MultiParentCasperImpl[F[_]: Sync: Capture: ConnectionsCell: TransportLayer
   ): F[CreateBlockStatus] =
     for {
       now                      <- Time[F].currentMillis
-      possibleProcessedDeploys <- updateKnownStateHashes(p, r)
+      possibleProcessedDeploys <- updateKnownStateHashes(p, r, now)
       result <- possibleProcessedDeploys match {
                  case Left(ex) =>
                    Log[F]
@@ -309,10 +311,10 @@ class MultiParentCasperImpl[F[_]: Sync: Capture: ConnectionsCell: TransportLayer
 
   private def updateKnownStateHashes(
       p: Seq[BlockMessage],
-      r: Seq[Deploy]
+      r: Seq[Deploy],
+      now: Long
   ): F[Either[Throwable, (StateHash, Seq[InternalProcessedDeploy])]] =
     for {
-      now <- Time[F].currentMillis
       possibleProcessedDeploys <- InterpreterUtil.computeDeploysCheckpoint[F](
                                    p,
                                    r,

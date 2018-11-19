@@ -39,7 +39,8 @@ class TcpServerObservable(
     val bufferTell        = buffer.LimitedBufferObservable.dropNew[ServerMessage](tellBufferSize)
     val bufferAsk         = buffer.LimitedBufferObservable.dropNew[ServerMessage](askBufferSize)
     val bufferBlobMessage = buffer.LimitedBufferObservable.dropNew[ServerMessage](blobBufferSize)
-    val merged            = Observable.merge(bufferTell, bufferAsk, bufferBlobMessage)(BackPressure(10))
+    val merged =
+      Observable(bufferTell, bufferAsk, bufferBlobMessage).mergeMap(identity)(BackPressure(10))
 
     val service = new RoutingGrpcMonix.TransportLayer {
 
@@ -81,14 +82,15 @@ class TcpServerObservable(
             peerNode: Option[PeerNode] = None,
             typeId: Option[String] = None,
             content: Option[(Array[Byte], Int)] = None,
-            decompressedLength: Option[Int] = None
+            contentLength: Option[Int] = None,
+            compressed: Boolean = false
         )
 
         object HeaderReceived {
           def unapply(chunk: Chunk): Option[(Option[PeerNode], String, Boolean, Int)] =
             chunk match {
-              case Chunk(Chunk.Content.Header(ChunkHeader(sender, typeId, compressed, dcl))) =>
-                Some(sender.map(ProtocolHelper.toPeerNode), typeId, compressed, dcl)
+              case Chunk(Chunk.Content.Header(ChunkHeader(sender, typeId, compressed, cl))) =>
+                Some(sender.map(ProtocolHelper.toPeerNode), typeId, compressed, cl)
               case _ => None
             }
         }
@@ -97,10 +99,10 @@ class TcpServerObservable(
           def unapply(temp: (PartialBlob, Chunk)): Option[(PartialBlob, Array[Byte], Int)] =
             temp match {
               case (
-                  partial @ PartialBlob(_, _, None, Some(dcl)),
+                  partial @ PartialBlob(_, _, None, Some(cl), _),
                   Chunk(Chunk.Content.Data(ChunkData(newData)))
                   ) =>
-                Some((partial, newData.toByteArray, dcl))
+                Some((partial, newData.toByteArray, cl))
               case _ => None
             }
         }
@@ -111,7 +113,7 @@ class TcpServerObservable(
           ): Option[(PartialBlob, Array[Byte], Array[Byte], Int)] =
             temp match {
               case (
-                  partial @ PartialBlob(_, _, Some((content, pointer)), _),
+                  partial @ PartialBlob(_, _, Some((content, pointer)), _, _),
                   Chunk(Chunk.Content.Data(ChunkData(newData)))
                   ) =>
                 Some(partial, content, newData.toByteArray, pointer)
@@ -125,11 +127,10 @@ class TcpServerObservable(
           * This is not implemented, thus temporaryly we do foldLef and gather partial data
           */
         def collect: Task[PartialBlob] = observable.foldLeftL(PartialBlob()) {
-          case (_, HeaderReceived(sender, typeId, compressed, dcLength)) =>
-            val dcl = if (compressed) Some(dcLength) else None
-            PartialBlob(sender, Some(typeId), None, dcl)
-          case FirstDataReceived(partial, firstData, dcl) =>
-            val data = new Array[Byte](dcl)
+          case (_, HeaderReceived(sender, typeId, compressed, contentLength)) =>
+            PartialBlob(sender, Some(typeId), None, Some(contentLength), compressed)
+          case FirstDataReceived(partial, firstData, contentLength) =>
+            val data = new Array[Byte](contentLength)
             firstData.copyToArray(data)
             partial.copy(content = Some((data, data.length)))
           case NextDataReceived(partial, currentData, newData, pointer) =>
@@ -138,24 +139,41 @@ class TcpServerObservable(
         }
 
         (collect >>= {
-          case PartialBlob(Some(peerNode), Some(typeId), Some((content, _)), dcLength) =>
-            Task.delay(
-              bufferBlobMessage.pushNext(
-                StreamMessage(
-                  Blob(
-                    peerNode,
-                    Packet().withTypeId(typeId).withContent(toContent(content, dcLength))
-                  )
-                )
-              )
-            )
+          case PartialBlob(
+              Some(peerNode),
+              Some(typeId),
+              Some((content, _)),
+              Some(contentLength),
+              compressed
+              ) =>
+            toContent(content, compressed, contentLength).attempt >>= {
+              case Left(th) => logger.error(th.getMessage)
+              case Right(content) =>
+                Task.delay {
+                  val packet = Packet()
+                    .withTypeId(typeId)
+                    .withContent(content)
+                  val blob = Blob(peerNode, packet)
+                  bufferBlobMessage.pushNext(StreamMessage(blob))
+                }
+            }
           case incorrect => logger.error(s"Streamed incorrect blob of data. Received $incorrect")
         }).as(ChunkResponse())
       }
 
-      private def toContent(raw: Array[Byte], decompressLength: Option[Int]): ByteString = {
-        val decompressed = (decompressLength >>= (raw.decompress(_))).getOrElse(raw)
-        ProtocolHelper.toProtocolBytes(decompressed)
+      private def toContent(
+          raw: Array[Byte],
+          compressed: Boolean,
+          contentLength: Int
+      ): Task[ByteString] = {
+        val decompressed: Task[Array[Byte]] = if (compressed) {
+          raw
+            .decompress(contentLength)
+            .fold(Task.raiseError[Array[Byte]](new RuntimeException("Could not decompress data")))(
+              _.pure[Task]
+            )
+        } else raw.pure[Task]
+        decompressed map ProtocolHelper.toProtocolBytes
       }
 
       private def returnProtocol(protocol: Protocol): TLResponse =

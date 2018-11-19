@@ -32,11 +32,11 @@ lazy val projectSettings = Seq(
     case Some(v) => Seq("-source", v, "-target", v)
   }),
   Test / fork := true,
-  Test / parallelExecution := true,
-  Test / testForkedParallel := true,
+  Test / parallelExecution := false,
+  Test / testForkedParallel := false,
   IntegrationTest / fork := true,
-  IntegrationTest / parallelExecution := true,
-  IntegrationTest / testForkedParallel := true
+  IntegrationTest / parallelExecution := false,
+  IntegrationTest / testForkedParallel := false
 )
 
 lazy val coverageSettings = Seq(
@@ -99,7 +99,7 @@ lazy val casper = (project in file("casper"))
     crypto,
     models,
     rspace,
-    rholang,
+    rholang      % "compile->compile;test->test",
     rholangProtoBuild
   )
 
@@ -337,7 +337,7 @@ lazy val roscala = (project in file("roscala"))
     mainClass in assembly := Some("coop.rchain.rosette.Main"),
     assemblyJarName in assembly := "rosette.jar",
     inThisBuild(
-      List(addCompilerPlugin("org.scalamacros" % "paradise" % "2.1.0" cross CrossVersion.full))
+      List(addCompilerPlugin("org.scalamacros" % "paradise" % "2.1.1" cross CrossVersion.full))
     ),
     libraryDependencies ++= commonDependencies
   )
@@ -444,7 +444,7 @@ lazy val rspaceBench = (project in file("rspace-bench"))
     run in Jmh := (run in Jmh).dependsOn(Keys.compile in Jmh).evaluated
   )
   .enablePlugins(JmhPlugin)
-  .dependsOn(rspace, rholang, models % "test->test")
+  .dependsOn(rspace % "test->test", rholang, models % "test->test")
 
 lazy val rchain = (project in file("."))
   .settings(commonSettings: _*)
