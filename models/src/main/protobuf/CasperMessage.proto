@@ -1,3 +1,6 @@
+/**
+ * The main API is `DeployService`.
+ */
 syntax = "proto3";
 package coop.rchain.casper.protocol;
 
@@ -17,19 +20,41 @@ option (scalapb.options) = {
 };
 
 // --------- DeployService  --------
+
+// Use `DoDeploy` to queue deployments of Rholang code and then
+// `addBlock` to make a new block with the results of running them
+// all.
+//
+// To get results back, use `listenForDataAtName`.
 service DeployService {
+  // Queue deployment of Rholang code (or fail to parse).
   rpc DoDeploy(DeployData) returns (DeployServiceResponse) {}
+  // Add a signed block, after validating it. (Typically used
+  // in node-to-node interactions rather than by dApps.)
   rpc addBlock(BlockMessage) returns (DeployServiceResponse) {}
+  // Add a block including all pending deploys.
   rpc createBlock(google.protobuf.Empty) returns (DeployServiceResponse) {}
+  // Get details about a particular block.
   rpc showBlock(BlockQuery) returns (BlockQueryResponse) {}
   rpc showMainChain(BlocksQuery) returns (stream BlockInfoWithoutTuplespace) {}
+  // Get a summary of blocks on the blockchain.
   rpc showBlocks(BlocksQuery) returns (stream BlockInfoWithoutTuplespace) {}
+  // Find data sent to a name.
   rpc listenForDataAtName(DataAtNameQuery) returns (ListeningNameDataResponse) {}
+  // Find processes receiving on a name.
   rpc listenForContinuationAtName(ContinuationAtNameQuery) returns (ListeningNameContinuationResponse) {}
+  // Find block from a deploy.
   rpc findBlockWithDeploy(FindDeployInBlockQuery) returns (BlockQueryResponse) {}
+  // Preview new top-level unforgeable names (for example, to compute signatures over them).
   rpc previewPrivateNames(PrivateNamePreviewQuery) returns (PrivateNamePreviewResponse) {}
 }
 
+
+/**
+ * Note: deploys are uniquely keyed by `user`, `timestamp`.
+ *
+ * **TODO**: details of signatures and payment. See RHOL-781
+ */
 message DeployData {
   bytes  user         = 1; //public key
   string term         = 2; //rholang source code to deploy (will be parsed into `Par`)
@@ -165,7 +190,7 @@ message ApprovedBlockCandidate {
 }
 
 message UnapprovedBlock {
-  ApprovedBlockCandidate candidate = 1; 
+  ApprovedBlockCandidate candidate = 1;
   int64                  timestamp = 2;
   int64                  duration  = 3;
 }
@@ -177,12 +202,12 @@ message Signature {
 }
 
 message BlockApproval {
-  ApprovedBlockCandidate candidate = 1; 
+  ApprovedBlockCandidate candidate = 1;
   Signature              sig       = 2;
 }
 
 message ApprovedBlock  {
-  ApprovedBlockCandidate candidate = 1; 
+  ApprovedBlockCandidate candidate = 1;
   repeated Signature     sigs      = 2;
 }
 
@@ -269,7 +294,7 @@ message ProduceEvent {
 }
 
 message ConsumeEvent {
-  bytes channelsHash = 1;
+  repeated bytes channelsHashes = 1;
   bytes hash = 2;
   int32 sequenceNumber = 3;
 }
@@ -284,5 +309,3 @@ message Bond {
   int64 stake     = 2;
 }
 // --------- End Core Protocol  --------
-
-
