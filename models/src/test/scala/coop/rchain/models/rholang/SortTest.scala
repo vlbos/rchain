@@ -7,7 +7,6 @@ import coop.rchain.models._
 import coop.rchain.models.rholang.SortTest.sort
 import coop.rchain.models.rholang.implicits._
 import coop.rchain.models.rholang.sorter._
-import coop.rchain.models.testImplicits._
 import monix.eval.Coeval
 import org.scalacheck.Arbitrary.arbitrary
 import org.scalacheck.{Arbitrary, Gen}
@@ -52,7 +51,7 @@ class ScoredTermSpec extends FlatSpec with PropertyChecks with Matchers {
     unsortedTerms.sorted should be(sortedTerms)
   }
   it should "sort so that unequal terms have unequal scores and the other way around" in {
-    def checkScoreEquality[A: Sortable: Arbitrary]: Unit = {
+    def checkScoreEquality[A: Sortable: Arbitrary]: Unit =
       // ScalaCheck generates similar A-s in subsequent calls which
       // we need to hit the case where `x == y` more often
       forAll(Gen.listOfN(5, arbitrary[A])) { as: List[A] =>
@@ -63,7 +62,9 @@ class ScoredTermSpec extends FlatSpec with PropertyChecks with Matchers {
             assert(sort(x).score == sort(y).score)
         }
       }
-    }
+
+    import coop.rchain.models.testImplicits._
+
     checkScoreEquality[Bundle]
     checkScoreEquality[Connective]
     checkScoreEquality[Expr]
@@ -73,6 +74,38 @@ class ScoredTermSpec extends FlatSpec with PropertyChecks with Matchers {
     checkScoreEquality[Receive]
     checkScoreEquality[Send]
     checkScoreEquality[Var]
+  }
+  it should "sort so that unequal ParMap have unequal scores" in {
+    val map1 = Expr(EMapBody(ParMap(Seq.empty, connectiveUsed = true, BitSet(), None)))
+    val map2 = Expr(EMapBody(ParMap(Seq.empty, connectiveUsed = false, BitSet(), None)))
+    assert(sort(map1).score != sort(map2).score)
+    val map3 = Expr(EMapBody(ParMap(Seq.empty, connectiveUsed = true, BitSet(), None)))
+    val map4 = Expr(EMapBody(ParMap(Seq.empty, connectiveUsed = true, BitSet(), Some(Var()))))
+    assert(sort(map3).score != sort(map4).score)
+  }
+  it should "sort so that unequal ParSet have unequal scores" in {
+    val set1 =
+      Expr(ESetBody(ParSet(Seq.empty, connectiveUsed = true, Coeval.delay(BitSet()), None)))
+    val set2 =
+      Expr(ESetBody(ParSet(Seq.empty, connectiveUsed = false, Coeval.delay(BitSet()), None)))
+    assert(sort(set1).score != sort(set2).score)
+    val set3 =
+      Expr(ESetBody(ParSet(Seq.empty, connectiveUsed = true, Coeval.delay(BitSet()), None)))
+    val set4 =
+      Expr(ESetBody(ParSet(Seq.empty, connectiveUsed = true, Coeval.delay(BitSet()), Some(Var()))))
+    assert(sort(set3).score != sort(set4).score)
+  }
+  it should "sort so that unequal List have unequal scores" in {
+    val list1 =
+      Expr(EListBody(EList(Seq.empty, AlwaysEqual(BitSet()), connectiveUsed = true, None)))
+    val list2 =
+      Expr(EListBody(EList(Seq.empty, AlwaysEqual(BitSet()), connectiveUsed = false, None)))
+    assert(sort(list1).score != sort(list2).score)
+    val list3 =
+      Expr(EListBody(EList(Seq.empty, AlwaysEqual(BitSet()), connectiveUsed = true, None)))
+    val list4 =
+      Expr(EListBody(EList(Seq.empty, AlwaysEqual(BitSet()), connectiveUsed = true, Some(Var()))))
+    assert(sort(list3).score != sort(list4).score)
   }
 }
 

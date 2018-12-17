@@ -21,7 +21,7 @@ lazy val projectSettings = Seq(
     Resolver.sonatypeRepo("snapshots"),
     "jitpack" at "https://jitpack.io"
   ),
-  scalafmtOnCompile := true,
+  scalafmtOnCompile := sys.env.get("CI").isEmpty, // disable in CI environments
   scapegoatVersion in ThisBuild := "1.3.4",
   testOptions in Test += Tests.Argument("-oD"), //output test durations
   dependencyOverrides ++= Seq(
@@ -36,8 +36,16 @@ lazy val projectSettings = Seq(
   Test / testForkedParallel := false,
   IntegrationTest / fork := true,
   IntegrationTest / parallelExecution := false,
-  IntegrationTest / testForkedParallel := false
-)
+  IntegrationTest / testForkedParallel := false,
+) ++
+// skip api doc generation if SKIP_DOC env variable is defined 
+Seq(sys.env.get("SKIP_DOC")).flatMap { _ =>
+  Seq(
+    publishArtifact in (Compile, packageDoc) := false,
+    publishArtifact in packageDoc := false,
+    sources in (Compile, doc) := Seq.empty
+  )
+}
 
 lazy val coverageSettings = Seq(
   coverageMinimum := 90,
@@ -76,9 +84,22 @@ lazy val shared = (project in file("shared"))
       monix,
       scodecCore,
       scodecBits,
-      scalapbRuntimegGrpc
+      scalapbRuntimegGrpc,
+      catsLawsTest,
+      catsLawsTestkitTest
     )
   )
+
+lazy val graphz = (project in file("graphz"))
+  .settings(commonSettings: _*)
+  .settings(
+    version := "0.1",
+    libraryDependencies ++= commonDependencies ++ Seq(
+      catsCore,
+      catsEffect,
+      catsMtl
+    )
+  ).dependsOn(shared)
 
 lazy val casper = (project in file("casper"))
   .settings(commonSettings: _*)
@@ -96,6 +117,7 @@ lazy val casper = (project in file("casper"))
     blockStorage % "compile->compile;test->test",
     comm         % "compile->compile;test->test",
     shared       % "compile->compile;test->test",
+    graphz,
     crypto,
     models,
     rspace,
@@ -126,7 +148,7 @@ lazy val comm = (project in file("comm"))
       grpcmonix.generators.GrpcMonixGenerator() -> (sourceManaged in Compile).value
     )
   )
-  .dependsOn(shared, crypto, models)
+  .dependsOn(shared % "compile->compile;test->test", crypto, models)
 
 lazy val crypto = (project in file("crypto"))
   .settings(commonSettings: _*)
@@ -170,7 +192,7 @@ lazy val node = (project in file("node"))
   .settings(commonSettings: _*)
   .enablePlugins(RpmPlugin, DebianPlugin, JavaAppPackaging, BuildInfoPlugin)
   .settings(
-    version := "0.7.1",
+    version := "0.8.1",
     name := "rnode",
     maintainer := "Pyrofex, Inc. <info@pyrofex.net>",
     packageSummary := "RChain Node",
@@ -315,7 +337,10 @@ lazy val rholang = (project in file("rholang"))
       catsEffect,
       monix,
       scallop,
-      lightningj
+      lightningj,
+      catsLawsTest,
+      catsLawsTestkitTest,
+      catsMtlLawsTest
     ),
     mainClass in assembly := Some("coop.rchain.rho2rose.Rholang2RosetteCompiler"),
     coverageExcludedFiles := Seq(
@@ -328,7 +353,12 @@ lazy val rholang = (project in file("rholang"))
     //constrain the resource usage so that we hit SOE-s and OOME-s more quickly should they happen
     javaOptions in Test ++= Seq("-Xss240k", "-XX:MaxJavaStackTraceDepth=10000", "-Xmx128m")
   )
-  .dependsOn(models % "compile->compile;test->test", rspace % "compile->compile;test->test", crypto)
+  .dependsOn(
+    models % "compile->compile;test->test",
+    rspace % "compile->compile;test->test",
+    shared % "compile->compile;test->test",
+    crypto
+  )
 
 lazy val rholangCLI = (project in file("rholang-cli"))
   .settings(commonSettings: _*)
@@ -486,6 +516,7 @@ lazy val rchain = (project in file("."))
     casper,
     comm,
     crypto,
+    graphz,
     models,
     node,
     regex,

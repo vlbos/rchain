@@ -1,16 +1,20 @@
 package coop.rchain.node
 
 import scala.concurrent.duration._
-
 import cats._
 import cats.data._
 import cats.effect._
-import cats.effect.concurrent.Ref
+import cats.effect.concurrent.{Ref, Semaphore}
 import cats.syntax.applicative._
 import cats.syntax.apply._
 import cats.syntax.functor._
 import coop.rchain.blockstorage.BlockStore.BlockHash
-import coop.rchain.blockstorage.{BlockStore, InMemBlockStore}
+import coop.rchain.blockstorage.{
+  BlockDagFileStorage,
+  BlockStore,
+  InMemBlockDagStorage,
+  InMemBlockStore
+}
 import coop.rchain.casper._
 import coop.rchain.casper.MultiParentCasperRef.MultiParentCasperRef
 import coop.rchain.casper.protocol.BlockMessage
@@ -33,7 +37,6 @@ import coop.rchain.node.diagnostics._
 import coop.rchain.p2p.effects._
 import coop.rchain.rholang.interpreter.Runtime
 import coop.rchain.shared._
-
 import kamon._
 import kamon.zipkin.ZipkinReporter
 import monix.eval.Task
@@ -82,7 +85,7 @@ class NodeRuntime private[node] (
       httpServer: Fiber[Task, Unit]
   )
 
-  def acquireServers(runtime: Runtime)(
+  def acquireServers(runtime: Runtime, blockApiLock: Semaphore[Effect])(
       implicit
       nodeDiscovery: NodeDiscovery[Task],
       blockStore: BlockStore[Effect],
@@ -90,7 +93,8 @@ class NodeRuntime private[node] (
       multiParentCasperRef: MultiParentCasperRef[Effect],
       nodeCoreMetrics: NodeMetrics[Task],
       jvmMetrics: JvmMetrics[Task],
-      connectionsCell: ConnectionsCell[Task]
+      connectionsCell: ConnectionsCell[Task],
+      concurrent: Concurrent[Effect]
   ): Effect[Servers] = {
     implicit val s: Scheduler = scheduler
     for {
@@ -98,7 +102,8 @@ class NodeRuntime private[node] (
                              .acquireExternalServer[Effect](
                                conf.grpcServer.portExternal,
                                conf.server.maxMessageSize,
-                               grpcScheduler
+                               grpcScheduler,
+                               blockApiLock
                              )
       grpcServerInternal <- GrpcServer
                              .acquireInternalServer(
@@ -224,12 +229,13 @@ class NodeRuntime private[node] (
       } yield ()
 
     for {
-      _       <- info
-      local   <- peerNodeAsk.ask.toEffect
-      host    = local.endpoint.host
-      servers <- acquireServers(runtime)
-      _       <- addShutdownHook(servers, runtime, casperRuntime).toEffect
-      _       <- servers.grpcServerExternal.start.toEffect
+      blockApiLock <- Semaphore[Effect](1)
+      _            <- info
+      local        <- peerNodeAsk.ask.toEffect
+      host         = local.endpoint.host
+      servers      <- acquireServers(runtime, blockApiLock)
+      _            <- addShutdownHook(servers, runtime, casperRuntime).toEffect
+      _            <- servers.grpcServerExternal.start.toEffect
       _ <- Log[Effect].info(
             s"gRPC external server started at $host:${servers.grpcServerExternal.port}"
           )
@@ -327,6 +333,12 @@ class NodeRuntime private[node] (
       blockMap,
       Metrics.eitherT(Monad[Task], metrics)
     )
+    blockDagStorage <- InMemBlockDagStorage.create[Effect](
+                        Concurrent[Effect],
+                        Sync[Effect],
+                        Log.eitherTLog(Monad[Task], log),
+                        blockStore
+                      )
     _       <- blockStore.clear() // TODO: Replace with a proper casper init when it's available
     oracle  = SafetyOracle.turanOracle[Effect](Monad[Effect])
     runtime = Runtime.create(storagePath, storageSize, storeType)(rspaceScheduler)
@@ -335,6 +347,9 @@ class NodeRuntime private[node] (
           .toEffect
     casperRuntime  = Runtime.create(casperStoragePath, storageSize, storeType)(rspaceScheduler)
     runtimeManager = RuntimeManager.fromRuntime(casperRuntime)(scheduler)
+    abs = new ToAbstractContext[Effect] {
+      def fromTask[A](fa: Task[A]): Effect[A] = fa.toEffect
+    }
     casperPacketHandler <- CasperPacketHandler
                             .of[Effect](conf.casper, defaultTimeout, runtimeManager, _.value)(
                               labEff,
@@ -348,9 +363,12 @@ class NodeRuntime private[node] (
                               oracle,
                               Capture[Effect],
                               Sync[Effect],
+                              Concurrent[Effect],
                               Time.eitherTTime(Monad[Task], time),
                               Log.eitherTLog(Monad[Task], log),
                               multiParentCasperRef,
+                              blockDagStorage,
+                              abs,
                               scheduler
                             )
     packetHandler = PacketHandler.pf[Effect](casperPacketHandler.handle)(
