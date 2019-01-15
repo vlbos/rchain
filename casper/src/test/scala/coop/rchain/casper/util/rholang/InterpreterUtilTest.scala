@@ -6,6 +6,7 @@ import cats.mtl.implicits._
 import cats.{Id, Monad}
 import cats.implicits._
 import com.google.protobuf.ByteString
+import coop.rchain.catscontrib.TaskContrib._
 import coop.rchain.blockstorage.{
   BlockDagRepresentation,
   BlockDagStorage,
@@ -23,10 +24,10 @@ import coop.rchain.rholang.interpreter.Runtime
 import coop.rchain.models.PCost
 import coop.rchain.p2p.EffectsTestInstances.LogStub
 import coop.rchain.rholang.interpreter.accounting
-import coop.rchain.shared.Time
+import coop.rchain.shared.{StoreType, Time}
 import monix.eval.Task
 import monix.execution.Scheduler.Implicits.global
-import org.scalatest.{Assertion, FlatSpec, Matchers}
+import org.scalatest._
 
 import scala.concurrent.duration._
 
@@ -37,8 +38,9 @@ class InterpreterUtilTest
     with BlockDagStorageFixture {
   val storageSize      = 1024L * 1024
   val storageDirectory = Files.createTempDirectory("casper-interp-util-test")
-  val activeRuntime    = Runtime.create(storageDirectory, storageSize)
-  val runtimeManager   = RuntimeManager.fromRuntime(activeRuntime)
+  val activeRuntime =
+    Runtime.create[Task, Task.Par](storageDirectory, storageSize, StoreType.LMDB).unsafeRunSync
+  val runtimeManager = RuntimeManager.fromRuntime(activeRuntime).unsafeRunSync
 
   implicit val logEff = new LogStub[Task]
 
@@ -91,7 +93,8 @@ class InterpreterUtilTest
           blockCheckpoint                             <- computeBlockCheckpoint(genesis, genesis, dag1, runtimeManager)
           (postGenStateHash, postGenProcessedDeploys) = blockCheckpoint
           _                                           <- injectPostStateHash[Task](0, genesis, postGenStateHash, postGenProcessedDeploys)
-          genPostState                                = runtimeManager.storageRepr(postGenStateHash).get
+          genPostStateT                               <- runtimeManager.storageRepr(postGenStateHash)
+          genPostState                                = genPostStateT.get
 
           _                                         = genPostState.contains("@{2}!(2)") should be(true)
           _                                         = genPostState.contains("@{123}!(5)") should be(true)
@@ -99,7 +102,8 @@ class InterpreterUtilTest
           blockCheckpointB1                         <- computeBlockCheckpoint(b1, genesis, dag2, runtimeManager)
           (postB1StateHash, postB1ProcessedDeploys) = blockCheckpointB1
           _                                         <- injectPostStateHash[Task](1, b1, postB1StateHash, postB1ProcessedDeploys)
-          b1PostState                               = runtimeManager.storageRepr(postB1StateHash).get
+          b1PostStateT                              <- runtimeManager.storageRepr(postB1StateHash)
+          b1PostState                               = b1PostStateT.get
           _                                         = b1PostState.contains("@{1}!(1)") should be(true)
           _                                         = b1PostState.contains("@{123}!(5)") should be(true)
           _                                         = b1PostState.contains("@{456}!(10)") should be(true)
@@ -121,7 +125,8 @@ class InterpreterUtilTest
                                 runtimeManager
                               )
           (postb3StateHash, _) = blockCheckpointB4
-          b3PostState          = runtimeManager.storageRepr(postb3StateHash).get
+          b3PostStateT         <- runtimeManager.storageRepr(postb3StateHash)
+          b3PostState          = b3PostStateT.get
 
           _      = b3PostState.contains("@{1}!(1)") should be(true)
           _      = b3PostState.contains("@{1}!(15)") should be(true)
@@ -205,7 +210,8 @@ class InterpreterUtilTest
                                 runtimeManager
                               )
           (postb3StateHash, _) = blockCheckpointB3
-          b3PostState          = runtimeManager.storageRepr(postb3StateHash).get
+          b3PostStateT         <- runtimeManager.storageRepr(postb3StateHash)
+          b3PostState          = b3PostStateT.get
 
           _      = b3PostState.contains("@{1}!(15)") should be(true)
           _      = b3PostState.contains("@{5}!(5)") should be(true)
@@ -383,7 +389,7 @@ class InterpreterUtilTest
   }
 
   def computeSingleProcessedDeploy(
-      runtimeManager: RuntimeManager,
+      runtimeManager: RuntimeManager[Task],
       dag: BlockDagRepresentation[Task],
       deploy: Deploy*
   )(implicit blockStore: BlockStore[Task]): Task[Seq[InternalProcessedDeploy]] =
@@ -830,4 +836,61 @@ class InterpreterUtilTest
         }
       }
   }
+
+  "findMultiParentsBlockHashesForReplay" should "filter out duplicate ancestors of main parent block" in withStorage {
+    implicit blockStore => implicit blockDagStorage =>
+      val genesisDeploysWithCost = prepareDeploys(Vector.empty, PCost(1))
+      val b1DeploysWithCost      = prepareDeploys(Vector("@1!(1)"), PCost(1))
+      val b2DeploysWithCost      = prepareDeploys(Vector("@2!(2)"), PCost(1))
+      val b3DeploysWithCost      = prepareDeploys(Vector("@3!(3)"), PCost(1))
+
+      /*
+       * DAG Looks like this:
+       *
+       *           b3
+       *          /  \
+       *        b1    b2
+       *         \    /
+       *         genesis
+       */
+
+      mkRuntimeManager("interpreter-util-test")
+        .use { runtimeManager =>
+          def step(index: Int, genesis: BlockMessage) =
+            for {
+              b1  <- blockDagStorage.lookupByIdUnsafe(index)
+              dag <- blockDagStorage.getRepresentation
+              computeBlockCheckpointResult <- computeBlockCheckpoint(
+                                               b1,
+                                               genesis,
+                                               dag,
+                                               runtimeManager
+                                             )
+              (postB1StateHash, postB1ProcessedDeploys) = computeBlockCheckpointResult
+              result <- injectPostStateHash[Task](
+                         index,
+                         b1,
+                         postB1StateHash,
+                         postB1ProcessedDeploys
+                       )
+            } yield result
+          for {
+            genesis <- createBlock[Task](Seq.empty, deploys = genesisDeploysWithCost)
+            b1      <- createBlock[Task](Seq(genesis.blockHash), deploys = b1DeploysWithCost)
+            b2      <- createBlock[Task](Seq(genesis.blockHash), deploys = b2DeploysWithCost)
+            b3      <- createBlock[Task](Seq(b1.blockHash, b2.blockHash), deploys = b3DeploysWithCost)
+            _       <- step(0, genesis)
+            _       <- step(1, genesis)
+            _       <- step(2, genesis)
+            dag     <- blockDagStorage.getRepresentation
+            blockHashes <- InterpreterUtil.findMultiParentsBlockHashesForReplay(
+                            Seq(b1, b2),
+                            dag
+                          )
+            _ = withClue("Main parent hasn't been filtered out: ") { blockHashes.size shouldBe (1) }
+
+          } yield ()
+        }
+  }
+
 }

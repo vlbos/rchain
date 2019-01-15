@@ -210,6 +210,15 @@ final case class Options(arguments: Seq[String]) extends ScallopConf(arguments) 
     val standalone =
       opt[Flag](short = 's', descr = "Start a stand-alone node (no bootstrapping).")
 
+    val prometheus =
+      opt[Flag](descr = "Enable the Prometheus metrics reporter")
+
+    val zipkin =
+      opt[Flag](descr = "Enable the Zipkin span reporter")
+
+    val sigar =
+      opt[Flag](descr = "Enable Sigar host system metrics")
+
     val requiredSigs =
       opt[Int](
         descr =
@@ -379,6 +388,11 @@ final case class Options(arguments: Seq[String]) extends ScallopConf(arguments) 
       opt[Int](
         name = "depth",
         descr = "depth in terms of block height"
+      )
+    val showJustificationLines =
+      opt[Boolean](
+        name = "showJustificationlines",
+        descr = "if justification lines should be shown"
       )
   }
   addSubcommand(visualizeBlocks)

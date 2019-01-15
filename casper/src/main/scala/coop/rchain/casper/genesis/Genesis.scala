@@ -3,7 +3,7 @@ package coop.rchain.casper.genesis
 import java.io.{File, PrintWriter}
 import java.nio.file.Path
 
-import cats.effect.Sync
+import cats.effect.{Concurrent, Sync}
 import cats.implicits._
 import cats.{Applicative, Foldable, Monad}
 import com.google.protobuf.ByteString
@@ -24,6 +24,7 @@ import scala.io.Source
 import scala.util.{Failure, Success, Try}
 import coop.rchain.casper.util.Sorting.byteArrayOrdering
 import coop.rchain.rholang.interpreter.accounting
+import monix.eval.Task
 
 import scala.concurrent.duration.Duration
 
@@ -50,15 +51,15 @@ object Genesis {
       StandardDeploys.rev(wallets, faucetCode, posParams)
     )
 
-  def withContracts(
+  def withContracts[F[_]: Concurrent](
       initial: BlockMessage,
       posParams: ProofOfStakeParams,
       wallets: Seq[PreWallet],
       faucetCode: String => String,
       startHash: StateHash,
-      runtimeManager: RuntimeManager,
+      runtimeManager: RuntimeManager[F],
       timestamp: Long
-  )(implicit scheduler: Scheduler): BlockMessage =
+  ): F[BlockMessage] =
     withContracts(
       defaultBlessedTerms(timestamp, posParams, wallets, faucetCode),
       initial,
@@ -66,32 +67,33 @@ object Genesis {
       runtimeManager
     )
 
-  def withContracts(
+  def withContracts[F[_]: Concurrent](
       blessedTerms: List[Deploy],
       initial: BlockMessage,
       startHash: StateHash,
-      runtimeManager: RuntimeManager
-  )(implicit scheduler: Scheduler): BlockMessage = {
-    val (stateHash, processedDeploys) =
-      runtimeManager.computeState(startHash, blessedTerms).runSyncUnsafe(Duration.Inf)
+      runtimeManager: RuntimeManager[F]
+  ): F[BlockMessage] =
+    runtimeManager
+      .computeState(startHash, blessedTerms)
+      .map {
+        case (stateHash, processedDeploys) =>
+          val stateWithContracts = for {
+            bd <- initial.body
+            ps <- bd.state
+          } yield ps.withPreStateHash(runtimeManager.emptyStateHash).withPostStateHash(stateHash)
+          val version   = initial.header.get.version
+          val timestamp = initial.header.get.timestamp
 
-    val stateWithContracts = for {
-      bd <- initial.body
-      ps <- bd.state
-    } yield ps.withPreStateHash(runtimeManager.emptyStateHash).withPostStateHash(stateHash)
-    val version   = initial.header.get.version
-    val timestamp = initial.header.get.timestamp
+          val blockDeploys =
+            processedDeploys.filterNot(_.status.isFailed).map(ProcessedDeployUtil.fromInternal)
+          val sortedDeploys = blockDeploys.map(d => d.copy(log = d.log.sortBy(_.toByteArray)))
 
-    val blockDeploys =
-      processedDeploys.filterNot(_.status.isFailed).map(ProcessedDeployUtil.fromInternal)
-    val sortedDeploys = blockDeploys.map(d => d.copy(log = d.log.sortBy(_.toByteArray)))
+          val body = Body(state = stateWithContracts, deploys = sortedDeploys)
 
-    val body = Body(state = stateWithContracts, deploys = sortedDeploys)
+          val header = blockHeader(body, List.empty[ByteString], version, timestamp)
 
-    val header = blockHeader(body, List.empty[ByteString], version, timestamp)
-
-    unsignedBlockProto(body, header, List.empty[Justification], initial.shardId)
-  }
+          unsignedBlockProto(body, header, List.empty[Justification], initial.shardId)
+      }
 
   def withoutContracts(
       bonds: Map[Array[Byte], Long],
@@ -126,7 +128,7 @@ object Genesis {
       minimumBond: Long,
       maximumBond: Long,
       faucet: Boolean,
-      runtimeManager: RuntimeManager,
+      runtimeManager: RuntimeManager[Task],
       shardId: String,
       deployTimestamp: Option[Long]
   )(implicit scheduler: Scheduler): F[BlockMessage] =
@@ -155,7 +157,7 @@ object Genesis {
         runtimeManager.emptyStateHash,
         runtimeManager,
         timestamp
-      )
+      ).runSyncUnsafe(Duration.Inf)
     } yield withContr
 
   def toFile[F[_]: Applicative: Log](
