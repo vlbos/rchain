@@ -1,7 +1,9 @@
 package coop.rchain.comm.transport
 
 import java.util.UUID
+import coop.rchain.shared.Log
 import coop.rchain.shared.GracefulClose._
+import coop.rchain.shared.PathOps._
 import coop.rchain.catscontrib.ski._
 import java.io.FileOutputStream
 import java.nio.file.{Files, Path}
@@ -22,23 +24,40 @@ import coop.rchain.comm.transport.PacketOps._
 
 object StreamHandler {
 
-  private case class Streamed(
+  type CircuitBreaker = Long => Boolean
+
+  private final case class Streamed(
       sender: Option[PeerNode] = None,
       typeId: Option[String] = None,
       contentLength: Option[Int] = None,
       compressed: Boolean = false,
+      readSoFar: Long = 0,
+      circuitBroken: Boolean = false,
       path: Path,
       fos: FileOutputStream
   )
 
   def handleStream(
       folder: Path,
-      stream: Observable[Chunk]
-  ): Task[Either[Throwable, StreamMessage]] =
+      stream: Observable[Chunk],
+      circuitBreaker: CircuitBreaker
+  )(implicit log: Log[Task]): Task[Either[Throwable, StreamMessage]] =
     (init(folder)
-      .bracket { initStmd =>
-        (collect(initStmd, stream) >>= toResult).value
-      }(stmd => gracefullyClose[Task](stmd.fos).as(())))
+      .bracketE { initStmd =>
+        (collect(initStmd, stream, circuitBreaker) >>= toResult).value
+      }({
+        // failed while collecting stream
+        case (stmd, Right(Left(ex))) =>
+          gracefullyClose[Task](stmd.fos).as(()) *>
+            stmd.path.deleteSingleFile[Task]
+        // should not happend (errors handled witin bracket) but covered for safety
+        case (stmd, Left(_)) =>
+          gracefullyClose[Task](stmd.fos).as(()) *>
+            stmd.path.deleteSingleFile[Task]
+        // succesfully collected
+        case (stmd, _) =>
+          gracefullyClose[Task](stmd.fos).as(())
+      }))
       .attempt
       .map(_.flatten)
 
@@ -51,35 +70,68 @@ object StreamHandler {
 
   private def collect(
       init: Streamed,
-      stream: Observable[Chunk]
-  ): EitherT[Task, Throwable, Streamed] =
-    EitherT(
-      (stream
-        .foldLeftL(init) {
-          case (stmd, Chunk(Chunk.Content.Header(ChunkHeader(sender, typeId, compressed, cl)))) =>
-            stmd.copy(
-              sender = sender.map(ProtocolHelper.toPeerNode(_)),
-              typeId = Some(typeId),
-              compressed = compressed,
-              contentLength = Some(cl)
-            )
-          case (stmd, Chunk(Chunk.Content.Data(ChunkData(newData)))) =>
-            stmd.fos.write(newData.toByteArray)
-            stmd.fos.flush()
-            stmd
-        })
-        .attempt
-    )
+      stream: Observable[Chunk],
+      circuitBreaker: CircuitBreaker
+  )(implicit log: Log[Task]): EitherT[Task, Throwable, Streamed] = {
 
-  private def toResult(stmd: Streamed): EitherT[Task, Throwable, StreamMessage] =
+    def collectStream = stream.foldWhileLeftL(init) {
+      case (stmd, Chunk(Chunk.Content.Header(ChunkHeader(sender, typeId, compressed, cl)))) =>
+        Left(
+          stmd.copy(
+            sender = sender.map(ProtocolHelper.toPeerNode(_)),
+            typeId = Some(typeId),
+            compressed = compressed,
+            contentLength = Some(cl)
+          )
+        )
+      case (stmd, Chunk(Chunk.Content.Data(ChunkData(newData)))) =>
+        val array = newData.toByteArray
+        stmd.fos.write(array)
+        stmd.fos.flush()
+        val readSoFar = stmd.readSoFar + array.length
+        if (circuitBreaker(readSoFar))
+          Right(stmd.copy(circuitBroken = true))
+        else
+          Left(stmd.copy(readSoFar = readSoFar))
+    }
+
+    EitherT(collectStream.attempt.map {
+      case Right(stmd) if stmd.circuitBroken =>
+        new RuntimeException("Circuit was broken").asLeft
+      case res => res
+    })
+
+  }
+
+  private def toResult(
+      stmd: Streamed
+  )(implicit logger: Log[Task]): EitherT[Task, Throwable, StreamMessage] = {
+    val notFullError = new RuntimeException(
+      s"received not full stream message, will not process. $stmd"
+    ).asLeft[StreamMessage]
+
     EitherT(Task.delay {
       stmd match {
-        case Streamed(Some(sender), Some(packetType), Some(contentLength), compressed, path, _) =>
-          Right(StreamMessage(sender, packetType, path, compressed, contentLength))
-        case stmd =>
-          Left(new RuntimeException(s"received not full stream message, will not process. $stmd"))
+        case Streamed(
+            Some(sender),
+            Some(packetType),
+            Some(contentLength),
+            compressed,
+            readSoFar,
+            _,
+            path,
+            _
+            ) =>
+          val result =
+            StreamMessage(sender, packetType, path, compressed, contentLength).asRight[Throwable]
+          if (!compressed && readSoFar != contentLength)
+            notFullError
+          else result
+
+        case stmd => notFullError
       }
     })
+  }
 
   def restore(msg: StreamMessage)(implicit logger: Log[Task]): Task[Either[Throwable, Blob]] =
     (fetchContent(msg.path).attempt >>= {
