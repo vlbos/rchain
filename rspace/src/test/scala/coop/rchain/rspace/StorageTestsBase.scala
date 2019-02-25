@@ -27,7 +27,7 @@ import scala.concurrent.ExecutionContext.Implicits.global
 trait StorageTestsBase[F[_], C, P, E, A, K] extends FlatSpec with Matchers with OptionValues {
   type T = ISpace[F, C, P, E, A, A, K]
 
-  implicit def syncF: Sync[F]
+  implicit def concurrentF: Concurrent[F]
   implicit def logF: Log[F]
   implicit def monadF: Monad[F]
   implicit def contextShiftF: ContextShift[F]
@@ -139,7 +139,7 @@ abstract class InMemoryStoreTestsBase[F[_]]
     implicit val codecK: Codec[StringsCaptor] = implicitly[Serialize[StringsCaptor]].toCodec
     val branch                                = Branch("inmem")
 
-    val ctx: Context[String, Pattern, String, StringsCaptor] = Context.createInMemory()
+    val ctx: Context[F, String, Pattern, String, StringsCaptor] = Context.createInMemory()
 
     run(for {
       testSpace <- RSpace.create[F, String, Pattern, Nothing, String, String, StringsCaptor](
@@ -186,7 +186,7 @@ abstract class LMDBStoreTestsBase[F[_]]
     implicit val codecK: Codec[StringsCaptor] = implicitly[Serialize[StringsCaptor]].toCodec
 
     val testBranch = Branch("test")
-    val env        = Context.create[String, Pattern, String, StringsCaptor](dbDir, mapSize)
+    val env        = Context.create[F, String, Pattern, String, StringsCaptor](dbDir, mapSize)
 
     run(for {
       testSpace <- RSpace.create[F, String, Pattern, Nothing, String, String, StringsCaptor](
@@ -233,7 +233,7 @@ abstract class MixedStoreTestsBase[F[_]]
     implicit val codecK: Codec[StringsCaptor] = implicitly[Serialize[StringsCaptor]].toCodec
 
     val testBranch = Branch("test")
-    val env        = Context.createMixed[String, Pattern, String, StringsCaptor](dbDir, mapSize)
+    val env        = Context.createMixed[F, String, Pattern, String, StringsCaptor](dbDir, mapSize)
 
     run(for {
       testSpace <- RSpace.create[F, String, Pattern, Nothing, String, String, StringsCaptor](
